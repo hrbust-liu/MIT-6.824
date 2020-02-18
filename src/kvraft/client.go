@@ -2,6 +2,8 @@ package raftkv
 
 import (
 	"labrpc"
+	"sync/atomic"
+	"time"
 )
 import "crypto/rand"
 import "math/big"
@@ -11,6 +13,8 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	lastLeader int
+	cid int64
+	seq int32
 }
 
 func nrand() int64 {
@@ -25,6 +29,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.lastLeader = 0
+	ck.cid = nrand()
 	return ck
 }
 
@@ -42,24 +47,27 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-	DPrintf("**********client:Get key:%v**********\n", key)
+//	DPrintf("**********client:Get key:%v**********\n", key)
 	if key == "" {
 		return ""
 	} else {
-		args := GetArgs{key}
 		n := len(ck.servers)
 		i := 0
+		args := GetArgs{key, ck.cid, ck.seq}
 		for {
 			reply := GetReply{}
 			server := (ck.lastLeader + i) % n
 			ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
 			if ok && reply.WrongLeader == false{
 				ck.lastLeader = server
-				DPrintf("Get success\n")
-				return reply.Value
+				if reply.Err == OK {
+				//	DPrintf("Get%v success\n", key)
+					return reply.Value
+				}
 			} else {
 				i++
 			}
+			time.Sleep(100*time.Millisecond)
 		}
 	}
 }
@@ -76,21 +84,25 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	DPrintf("**********client:%v key:%v, value:%v**********\n", op, key, value)
-	args := PutAppendArgs{key, value, op}
+//	DPrintf("**********client:%v key:%v, value:%v**********\n", op, key, value)
+	seq := atomic.AddInt32(&ck.seq, 1)
 	n := len(ck.servers)
 	i := 0
+	args := PutAppendArgs{key, value, op, ck.cid, seq}
 	for {
 		reply := PutAppendReply{}
 		server := (ck.lastLeader+i) % n
 		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
 		if ok && reply.WrongLeader == false {
 			ck.lastLeader = server
-			DPrintf("PutAppend success\n")
-			return
+			if reply.Err == OK {
+			//	DPrintf("PutAppend%v success\n", key)
+				return
+			}
 		} else {
 			i++
 		}
+		time.Sleep(100*time.Millisecond)
 	}
 }
 

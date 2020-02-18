@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -26,8 +27,14 @@ type Op struct {
 	Key string
 	Value string
 	Type string
+
+	Cid int64
+	Seq int32
 }
 
+func (a *Op) equals(b Op) bool {
+	return a.Seq == b.Seq && a.Cid == b.Cid && a.Value == b.Value && a.Key == b.Key && a.Type == b.Type
+}
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -39,56 +46,95 @@ type KVServer struct {
 	// Your definitions here.
 	keyValue map[string] string
 	getCh map[int]chan Op
+	cid_seq map[int64] int32
+	persister *raft.Persister
+
+	stat int
 }
 
 func (kv *KVServer) getAgreeCh(index int) chan Op{
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	ch, ok := kv.getCh[index]
 	if !ok{
 		ch = make(chan Op, 1)
 		kv.getCh[index] = ch
-	//	DPrintf("init ch %v\n", index)
 	}
+	kv.mu.Unlock()
 	return ch
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	index, _, isLeader := kv.rf.Start(Op{args.Key, "", "Get"})
 	reply.WrongLeader = false
+	seq, ok := kv.cid_seq[args.Cid]
+	if ok && seq > args.Seq {
+		kv.mu.Lock()
+		reply.Value = kv.keyValue[args.Key]
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	cmd := Op{args.Key, "", "Get", args.Cid, args.Seq}
+	index, _, isLeader := kv.rf.Start(cmd)
 	if !isLeader {
 		reply.WrongLeader = true
+		return
 	} else {
 		ch := kv.getAgreeCh(index)
+	//	defer delete(kv.getCh, index)
+		op := Op{}
+		DPrintf("select ")
 		select {
-		case <-ch:
+		case op = <-ch:
+			reply.Err = OK
+			DPrintf("%v agree\n", kv.me)
 			close(ch)
-			reply.Value = kv.keyValue[args.Key]
-		//	DPrintf("%v agree\n", kv.me)
-			return
 		case <-time.After(1000*time.Millisecond):
+			reply.Err = ErrTimeOut
+			reply.WrongLeader = true
+			DPrintf("timeout\n")
+			return
+		}
+		DPrintf("success\n")
+		if !cmd.equals(op) {
+			reply.Err = ErrWrongOp
 			reply.WrongLeader = true
 			return
 		}
+		kv.mu.Lock()
+		reply.Value = kv.keyValue[args.Key]
+		kv.mu.Unlock()
 	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	index, _, isLeader := kv.rf.Start(Op{args.Key, args.Value, args.Op})
+	cmd := Op{args.Key, args.Value, args.Op, args.Cid, args.Seq}
+	index, _, isLeader := kv.rf.Start(cmd)
 	reply.WrongLeader = false
 	if !isLeader {
 		reply.WrongLeader = true
+		return
 	} else {
 		ch := kv.getAgreeCh(index)
+	//	defer delete(kv.getCh, index)
 	//	DPrintf("%v is leader\n", kv.me)
+		op := Op{}
+		DPrintf("select ")
 		select {
-		case <- ch:
+		case op = <- ch:
+			reply.Err = OK
+			DPrintf("%v agree\n", kv.me)
 			close(ch)
-		//	DPrintf("%v agree\n", kv.me)
-			return
 		case <-time.After(1000*time.Millisecond):
+			reply.Err = ErrTimeOut
+			reply.WrongLeader = true
+			DPrintf("timeout\n")
+			return
+		}
+		DPrintf("success\n")
+		if !cmd.equals(op) {
+			reply.Err = ErrWrongOp
 			reply.WrongLeader = true
 			return
 		}
@@ -103,27 +149,82 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 //
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
+	kv.mu.Lock()
+	kv.stat = Dead
+	kv.mu.Unlock()
+	DPrintf("%v is dead\n", kv.me)
 	// Your code here, if desired.
+}
+func (kv *KVServer) checkSnapShot(index int) {
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if kv.persister.RaftStateSize() < kv.maxraftstate*9/10 {
+		return
+	}
+//	DPrintf("%v's log too large\n", kv.me)
+	go kv.rf.TakeSnapShot(index, kv.cid_seq, kv.keyValue)
 }
 func (kv *KVServer) waitSubmitLoop() {
 	for {
+		kv.mu.Lock()
+		stat := kv.stat
+		kv.mu.Unlock()
+		if stat == Dead {
+			return
+		}
 		select {
 		case msg := <-kv.applyCh:
-			op := msg.Command.(Op)
-		//	DPrintf("%v %v key:%v, value:%v\n", kv.me, op.Type, op.Key, op.Value)
-			kv.mu.Lock()
-			switch op.Type {
-			case "Put":
-				kv.keyValue[op.Key] = op.Value
-			case "Append":
-				kv.keyValue[op.Key] += op.Value
+			if msg.CommandValid {
+				op := msg.Command.(Op)
+				//	DPrintf("%v %v key:%v, value:%v\n", kv.me, op.Type, op.Key, op.Value)
+				kv.mu.Lock()
+				maxSeq, ok := kv.cid_seq[op.Cid]
+				if !ok || op.Seq > maxSeq {
+					switch op.Type {
+					case "Put":
+						kv.keyValue[op.Key] = op.Value
+					case "Append":
+						kv.keyValue[op.Key] += op.Value
+					}
+					kv.cid_seq[op.Cid] = op.Seq
+				}
+				kv.mu.Unlock()
+				kv.checkSnapShot(msg.CommandIndex)
+				kv.getAgreeCh(msg.CommandIndex) <- op
+			} else {
+				kv.readSnapShot(msg.Data)
 			}
-			kv.mu.Unlock()
-/*			for k, v := range kv.keyValue {
-				DPrintf("%v's key:%v, value:%v\n", kv.me, k, v)
-			}*/
-			kv.getAgreeCh(msg.CommandIndex) <- op
 		}
+	}
+}
+func (kv *KVServer) readSnapShot(data []byte)  {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var cid_seq map[int64] int32
+	var keyValue map[string] string
+
+	err := d.Decode(&cid_seq)
+	if err != nil {
+		log.Fatal("decode cid_seq error:", err)
+	} else {
+		kv.cid_seq = cid_seq
+	}
+	err = d.Decode(&keyValue)
+	if err != nil {
+		log.Fatal("decode keyValue error:", err)
+	} else {
+		kv.keyValue = keyValue
+	}
+//	DPrintf("%v read snapshot success\n", kv.me)
+}
+func (kv *KVServer) checkStatLoop()  {
+	for {
+		DPrintf("%v's stat:%v\n", kv.me, kv.stat)
+		time.Sleep(100*time.Millisecond)
 	}
 }
 //
@@ -157,6 +258,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.getCh = make(map[int]chan Op)
 	kv.keyValue = make(map[string] string)
+	kv.cid_seq = make(map[int64] int32)
+	kv.stat = Alive
+	kv.persister = persister
+	kv.readSnapShot(persister.ReadSnapshot())
+
 	go kv.waitSubmitLoop()
 
 	return kv
