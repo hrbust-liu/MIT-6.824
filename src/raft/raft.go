@@ -587,6 +587,7 @@ func (rf *Raft) startElection() {
 						rf.mu.Unlock()
 					//	fmt.Printf("%v vote for %v, vote count:%v\n", server, rf.me, rf.voteCount)
 					} else if reply.Term > rf.currentTerm{
+						// TODO
 						rf.mu.Lock()
 						rf.currentTerm = reply.Term
 						rf.stat = Follower
